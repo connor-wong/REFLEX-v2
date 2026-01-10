@@ -1,6 +1,6 @@
 # vision/vision_widget.py
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QSizePolicy
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap, QImage
 import cv2
 import time
@@ -16,12 +16,31 @@ from config import MODEL_PATH, CAMERA_ID, IMG_SIZE
 
 
 class VisionWidget(QWidget):
+    palm_held = Signal()  # Custom signal emitted when "Palms" held for 3s
+    thumb_held = Signal() # Custom signal emitted when "Thumbs up" held for 3s
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background-color: #000000;")
         self.setup_ui()
+
+        # Palm tracking
+        self.palm_detected = False
+        self.palm_start_time = None
+        self.PALM_HOLD_DURATION = 3.0
+
         self.start_vision_pipeline()
 
+    def set_controller(self, controller):
+        """Allow external access to the AppController"""
+        self.controller = controller
+
+    def current_mode(self) -> int:
+        """Safely get current mode, returns -1 if controller not set"""
+        if self.controller is None:
+            return -1
+        return self.controller.current_mode
+    
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -52,7 +71,6 @@ class VisionWidget(QWidget):
     def start_vision_pipeline(self):
         self.model = YOLO(MODEL_PATH, task="segment")
 
-        # Try V4L2 first (Linux), fallback to default
         self.cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(CAMERA_ID)
@@ -100,32 +118,58 @@ class VisionWidget(QWidget):
 
             results = self.model(frame, imgsz=IMG_SIZE, verbose=False)
 
-            # Remap class names
-            name_map = {
-                "Long hair": "Tie your hair",
-                "Lower legs": "Wear long pants",
-                "Exposed feet": "Wear covered shoes",
-                "Upper arms": "Wear short sleeve shirt"
-            }
-            for idx, label in results[0].names.items():
-                if label in name_map:
-                    results[0].names[idx] = name_map[label]
+            # Vision mode
+            if self.current_mode() == 1:
+                # Check if "Palms" class is detected in this frame
+                palm_detected_now = any("Palms" in results[0].names.get(cls_id, "") for cls_id in results[0].boxes.cls.int().tolist())
 
-            annotated = custom_annotate_segmentation(
-                image=results[0].orig_img,
-                results=results[0],
-                alpha=0.4,
-                font_scale=0.7,
-                text_thickness=1,
-                box_thickness=2
-            )
+                # Update palm hold state
+                if palm_detected_now:
+                    if not self.palm_detected:
+                        # First detection
+                        self.palm_detected = True
+                        self.palm_start_time = time.time()
 
-            if self.result_q.full():
-                try:
-                    self.result_q.get_nowait()
-                except queue.Empty:
-                    pass
-            self.result_q.put(annotated)
+                    elif (time.time() - self.palm_start_time) >= self.PALM_HOLD_DURATION: # Held for 3+ seconds → emit signal once
+                        if not hasattr(self, '_palm_signal_emitted'):
+                            self._palm_signal_emitted = True
+                            self.palm_held.emit()  # Trigger mode change
+                else:
+                    # Palm not visible → reset
+                    self.palm_detected = False
+                    self.palm_start_time = None
+                    if hasattr(self, '_palm_signal_emitted'):
+                        del self._palm_signal_emitted  # Allow future triggers
+
+                # Remap class names
+                name_map = {
+                    "Long hair": "Tie your hair",
+                    "Lower legs": "Wear long pants",
+                    "Exposed feet": "Wear covered shoes",
+                    "Upper arms": "Wear short sleeve shirt"
+                }
+
+                for idx, label in results[0].names.items():
+                    if label in name_map:
+                        results[0].names[idx] = name_map[label]
+
+                # Custom annotation
+                annotated = custom_annotate_segmentation(
+                    image=results[0].orig_img,
+                    results=results[0],
+                    alpha=0.4,
+                    font_scale=0.7,
+                    text_thickness=1,
+                    box_thickness=2
+                )
+
+                if self.result_q.full():
+                    try:
+                        self.result_q.get_nowait()
+                    except queue.Empty:
+                        pass
+
+                self.result_q.put(annotated)
 
     def update_display(self):
         if self.result_q.empty():
